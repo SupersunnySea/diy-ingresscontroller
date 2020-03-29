@@ -3,7 +3,10 @@ package watcher
 import (
 	"context"
 	"crypto/tls"
+	"sync"
 	"time"
+
+	"k8s.io/client-go/tools/cache"
 
 	"github.com/bep/debounce"
 	log "github.com/sirupsen/logrus"
@@ -20,7 +23,7 @@ type Watcher struct {
 
 type Payload struct {
 	Ingresses       []*IngressPayload
-	TLSCertificates map[string]*tls.Certificate
+	TLSCertificates map[string]*tls.Certificate //key:secret name,value:certificate
 }
 
 type IngressPayload struct {
@@ -28,7 +31,7 @@ type IngressPayload struct {
 	ServicePorts map[string]map[string]int
 }
 
-func (w *Watcher) Run(ctx context.Context) {
+func (w *Watcher) Run(ctx context.Context) error {
 	factory := informers.NewSharedInformerFactory(w.client, time.Minute)
 	secretLister := factory.Core().V1().Secrets().Lister()
 	ingressLister := factory.Networking().V1beta1().Ingresses().Lister()
@@ -57,7 +60,7 @@ func (w *Watcher) Run(ctx context.Context) {
 		ingresses, err := ingressLister.List(labels.Everything())
 		if err != nil {
 			log.Errorf("list ingress error:%s", err.Error())
-			return
+			return err
 		}
 		for _, ingress := range ingresses {
 			ingressPayload := &IngressPayload{
@@ -94,4 +97,40 @@ func (w *Watcher) Run(ctx context.Context) {
 	}
 
 	debounced := debounce.New(time.Second)
+	handler := cache.ResourceEventHandlerFuncs{
+		AddFunc: func(obj interface{}) {
+			debounced(onChange)
+		},
+		UpdateFunc: func(oldobj, newobj interface{}) {
+			debounced(onChange)
+		},
+		DeleteFunc: func(obj interface{}) {
+			debounced(onChange)
+		},
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		informer := factory.Core().V1().Service().Informer()
+		informer.AddEventHandler(handler)
+		informer.Run(ctx.Done())
+		wg.Done()
+	}()
+	wg.Add(1)
+	go func() {
+		informer := factory.Networking().V1beta1().Ingress().Informer()
+		informer.AddEventHandler(handler)
+		informer.Run(ctx.Done())
+		wg.Done()
+	}()
+	wg.Add(1)
+	go func() {
+		informer := factory.Core().V1().Secret().Informer()
+		informer.AddEventHandler(handler)
+		informer.Run(ctx.Done())
+		wg.Done()
+	}()
+	wg.Wait()
+	return nil
 }
